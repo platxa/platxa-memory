@@ -12,5 +12,18 @@
     "memory",
     "context",
     "claude-code"
-  ]
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session_start_hook.py"
+          }
+        ]
+      }
+    ]
+  }
 }
