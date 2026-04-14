@@ -65,12 +65,18 @@ yarn-error.log*
 Thumbs.db
 
 # Claude Code local state
-.claude/settings.local.json
+# Match platxa-code-agent convention: ignore everything in .claude/ except
+# explicitly re-included paths below. Spec workflow state, research history,
+# findings, snapshots, and progress logs are local-only — not committed.
+.claude/*
+.claude-plugin/.claude/
+**/.claude/shared_state.json
+# Re-include shareable sub-paths once they exist:
+!.claude/commands/
+!.claude/output-styles/
+!.claude/init.sh
+!.claude/CHANGELOG.md
 CLAUDE.local.md
-.claude/agent-memory-local/
-.claude/*.lock
-.claude/observations.jsonl
-.claude/research.json
 
 # Build artifacts
 *.log
