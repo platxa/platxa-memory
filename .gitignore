@@ -82,3 +82,9 @@ CLAUDE.local.md
 *.log
 *.tmp
 .cache/
+
+# Local-only
+CLAUDE.md
+checkpoints/
+mao_state.db
+.claude/
