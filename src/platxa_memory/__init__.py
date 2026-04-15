@@ -9,12 +9,16 @@ Hard constraint (see CLAUDE.md): stdlib only — no SDK, no API, no LLM.
 """
 
 from .atomic import atomic_write, atomic_write_bytes, atomic_write_text
+from .migration import MigrationResult, detect_format_version, migrate_v1_to_v2
 from .stack import StackInfo, detect_stack
 
 __all__ = (
+    "MigrationResult",
     "StackInfo",
     "atomic_write",
     "atomic_write_bytes",
     "atomic_write_text",
+    "detect_format_version",
     "detect_stack",
+    "migrate_v1_to_v2",
 )

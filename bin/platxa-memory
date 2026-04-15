@@ -34,6 +34,15 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+# ---- internal package path -------------------------------------------------
+# Allow the CLI to import ``platxa_memory`` when run directly from the repo
+# without ``pip install -e .``.  This is a no-op when the package is already
+# on sys.path (e.g. after installation or under pytest with pythonpath=["src"]).
+_CLI_ROOT = Path(__file__).resolve().parent.parent
+_SRC = _CLI_ROOT / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
 # --- shared constants -------------------------------------------------------
 
 STACK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -454,22 +463,53 @@ def cmd_restore(args: argparse.Namespace) -> int:
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
+    from platxa_memory.migration import detect_format_version, migrate_v1_to_v2
+
     project = _project_dir(args.project)
-    report = {
-        "project": str(project),
-        "current_format_version": "1.0",
-        "target_format_version": "1.0",
-        "migrations_applied": [],
-        "status": "up-to-date",
-        "note": "No memory-format migrations are defined yet; this subcommand "
-        "is a stable entrypoint for future schema changes.",
-    }
+    auto_dir = _auto_memory_dir(args.auto_dir)
+
+    if auto_dir is None:
+        report: dict = {
+            "project": str(project),
+            "migrations_applied": [],
+            "status": "up-to-date",
+            "note": "No auto-memory directory found; nothing to migrate.",
+        }
+    else:
+        version = detect_format_version(auto_dir)
+        if version == "v1":
+            result = migrate_v1_to_v2(auto_dir)
+            report = {
+                "project": str(project),
+                "auto_memory_dir": str(auto_dir),
+                "migrations_applied": result.migrations_applied,
+                "topic_files_written": result.topic_files_written,
+                "bullets_migrated": result.bullets_migrated,
+                "status": result.status,
+            }
+        else:
+            note = "no MEMORY.md found" if version == "none" else f"detected format: {version}"
+            report = {
+                "project": str(project),
+                "auto_memory_dir": str(auto_dir),
+                "migrations_applied": [],
+                "status": "up-to-date",
+                "note": note,
+            }
+
     if args.format == "json":
         print(json.dumps(report, indent=2))
     else:
         print(f"status:  {report['status']}")
-        print(f"format:  {report['current_format_version']}")
-        print(f"note:    {report['note']}")
+        migrations = report.get("migrations_applied") or []
+        if migrations:
+            print(f"applied: {', '.join(str(m) for m in migrations)}")
+        files = report.get("topic_files_written") or []
+        for fname in files:
+            print(f"  wrote: {fname}")
+        note = report.get("note", "")
+        if note:
+            print(f"note:    {note}")
     return 0
 
 
@@ -631,15 +671,17 @@ def build_parser() -> argparse.ArgumentParser:
     # migrate
     p = sub.add_parser(
         "migrate",
-        help="Apply memory-format migrations (currently no-op)",
+        help="Apply memory-format migrations (v1 plain bullets → v2 frontmatter index)",
         description=(
-            "Stable entrypoint for future memory-format migrations. Runs any "
-            "registered migrations in order and reports the result. No "
-            "migrations are defined today — this subcommand exits 0 with an "
-            "up-to-date status."
+            "Detect the schema version of the auto-memory directory and apply "
+            "any pending migrations in order. Currently supports one edge: "
+            "v1 (plain MEMORY.md bullets) → v2 (frontmatter-backed topic files). "
+            "Idempotent: running on an already-current directory exits 0 with "
+            "status 'up-to-date'."
         ),
     )
     _add_project_arg(p)
+    _add_auto_dir_arg(p)
     _add_format_arg(p)
     p.set_defaults(func=cmd_migrate)
 
