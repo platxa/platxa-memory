@@ -1,4 +1,5 @@
 {
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "platxa-memory",
   "version": "0.1.0",
   "description": "Production-grade Claude Code memory plugin. Cross-session memory, context injection, and compaction survival using only native Claude Code primitives — no SDK, no API, no LLM calls in plugin code.",
@@ -11,6 +12,7 @@
   "keywords": [
     "memory",
     "context",
+    "compaction",
     "claude-code"
   ],
   "hooks": {
@@ -41,6 +43,27 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/post_compact_hook.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop_hook.py"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretool_stop_guard.py"
           }
         ]
       }

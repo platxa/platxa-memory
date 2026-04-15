@@ -1,0 +1,7 @@
+{
+  "name": "platxa-memory",
+  "source": "./plugins/platxa-memory",
+  "description": "Production-grade Claude Code memory plugin. Cross-session memory, context injection, and compaction survival using only native Claude Code primitives — no SDK, no API, no LLM calls in plugin code.",
+  "category": "Memory",
+  "homepage": "https://github.com/platxa/platxa-memory"
+}
