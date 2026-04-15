@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""platxa-memory CLI — non-interactive access to the memory plugin.
+
+The ``bin/`` directory of an enabled Claude Code plugin is prepended to
+``PATH`` by the host. Users (and automation) can call ``platxa-memory``
+directly without going through a slash-command.
+
+Subcommands
+-----------
+- ``detect-stack``  Print the project stack (python / typescript / … / generic)
+- ``health``        Report memory-dir presence + file counts
+- ``search``        Ripgrep-backed full-text search over memory files
+- ``export``        Archive the auto-memory directory to a tar.gz
+- ``import``        Restore an auto-memory directory from a tar.gz
+- ``prune``         Remove stale per-session Stop-hook markers
+- ``restore``       Alias of ``import`` with overwrite semantics
+- ``migrate``       Placeholder for future memory-format migrations
+
+Hard constraint (see CLAUDE.md): stdlib only — no SDK, no API, no LLM,
+no third-party deps.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+from collections.abc import Sequence
+from pathlib import Path
+
+# --- shared constants -------------------------------------------------------
+
+STACK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("python", ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt")),
+    ("typescript", ("tsconfig.json",)),
+    ("javascript", ("package.json",)),
+    ("go", ("go.mod",)),
+    ("rust", ("Cargo.toml",)),
+    ("java", ("pom.xml", "build.gradle", "build.gradle.kts")),
+    ("ruby", ("Gemfile",)),
+)
+
+MARKER_PREFIX = ".memory-synthesized-"
+DEFAULT_PRUNE_DAYS = 7
+
+
+# --- shared helpers ---------------------------------------------------------
+
+
+def _project_dir(project: str | None) -> Path:
+    """Resolve project dir: CLI arg > env > cwd."""
+    if project:
+        return Path(project).expanduser().resolve()
+    env = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def _auto_memory_dir(override: str | None = None) -> Path | None:
+    """Locate the most-recent auto-memory dir (mirrors session_start_hook)."""
+    override_env = override or os.environ.get("PLATXA_MEMORY_AUTO_DIR", "").strip()
+    if override_env:
+        p = Path(override_env).expanduser()
+        return p if p.is_dir() else None
+
+    root = Path.home() / ".claude" / "projects"
+    if not root.is_dir():
+        return None
+
+    candidates: list[tuple[float, Path]] = []
+    try:
+        for entry in root.iterdir():
+            mem = entry / "memory"
+            if mem.is_dir():
+                candidates.append((mem.stat().st_mtime, mem))
+    except OSError:
+        return None
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _detect_stack(project: Path) -> str:
+    for stack, markers in STACK_MARKERS:
+        for marker in markers:
+            if (project / marker).is_file():
+                return stack
+    return "generic"
+
+
+# --- subcommand: detect-stack ----------------------------------------------
+
+
+def cmd_detect_stack(args: argparse.Namespace) -> int:
+    project = _project_dir(args.project)
+    stack = _detect_stack(project)
+    if args.format == "json":
+        print(json.dumps({"stack": stack, "project": str(project)}))
+    else:
+        print(stack)
+    return 0
+
+
+# --- subcommand: health -----------------------------------------------------
+
+
+def _count_topic_files(auto_dir: Path) -> int:
+    try:
+        return sum(1 for p in auto_dir.glob("*.md") if p.name != "MEMORY.md")
+    except OSError:
+        return 0
+
+
+def _count_markers(project: Path) -> int:
+    try:
+        return sum(1 for _ in (project / ".claude").glob(f"{MARKER_PREFIX}*"))
+    except OSError:
+        return 0
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    project = _project_dir(args.project)
+    auto_dir = _auto_memory_dir(args.auto_dir)
+    memory_md = auto_dir / "MEMORY.md" if auto_dir else None
+    has_memory = bool(memory_md and memory_md.is_file())
+    topic_count = _count_topic_files(auto_dir) if auto_dir else 0
+    marker_count = _count_markers(project)
+
+    report = {
+        "project": str(project),
+        "auto_memory_dir": str(auto_dir) if auto_dir else None,
+        "memory_md_present": has_memory,
+        "topic_files": topic_count,
+        "stop_markers": marker_count,
+        "status": "ok" if (auto_dir and has_memory) else "uninitialized",
+    }
+    if args.format == "json":
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"project:          {report['project']}")
+        print(f"auto_memory_dir:  {report['auto_memory_dir'] or '(none)'}")
+        print(f"MEMORY.md:        {'present' if has_memory else 'missing'}")
+        print(f"topic_files:      {topic_count}")
+        print(f"stop_markers:     {marker_count}")
+        print(f"status:           {report['status']}")
+    return 0 if report["status"] == "ok" else 1
+
+
+# --- subcommand: search -----------------------------------------------------
+
+
+def _rg_available() -> bool:
+    return shutil.which("rg") is not None
+
+
+def _search_with_rg(pattern: str, roots: list[Path], limit: int) -> list[str]:
+    # "--" terminates option parsing so patterns starting with "-" are not
+    # interpreted by rg as flags.
+    cmd = [
+        "rg",
+        "--no-messages",
+        "-n",
+        "-i",
+        "--color=never",
+        "--glob",
+        "*.md",
+        "--",
+        pattern,
+    ]
+    cmd.extend(str(r) for r in roots if r.is_dir() or r.is_file())
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    lines = [line for line in out.stdout.splitlines() if line.strip()]
+    return lines[:limit]
+
+
+def _search_python_fallback(pattern: str, roots: list[Path], limit: int) -> list[str]:
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return []
+    hits: list[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        files: list[Path] = [root] if root.is_file() else list(root.rglob("*.md"))
+        for f in files:
+            try:
+                with f.open("r", encoding="utf-8", errors="replace") as fh:
+                    for i, line in enumerate(fh, start=1):
+                        if regex.search(line):
+                            hits.append(f"{f}:{i}:{line.rstrip()}")
+                            if len(hits) >= limit:
+                                return hits
+            except OSError:
+                continue
+    return hits
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    project = _project_dir(args.project)
+    auto_dir = _auto_memory_dir(args.auto_dir)
+
+    roots: list[Path] = []
+    if args.scope in ("project", "all"):
+        roots.extend(
+            [
+                project / "CLAUDE.md",
+                project / ".claude" / "rules",
+                project / ".claude" / "agent-memory",
+                project / ".claude" / "instincts",
+            ]
+        )
+    if args.scope in ("user", "all") and auto_dir:
+        roots.append(auto_dir)
+
+    if _rg_available():
+        hits = _search_with_rg(args.pattern, roots, args.limit)
+    else:
+        hits = _search_python_fallback(args.pattern, roots, args.limit)
+
+    if args.format == "json":
+        print(json.dumps({"pattern": args.pattern, "hits": hits, "count": len(hits)}))
+    else:
+        for line in hits:
+            print(line)
+        if not hits:
+            print(f"(no matches for {args.pattern!r})", file=sys.stderr)
+    return 0 if hits else 1
+
+
+# --- subcommand: export -----------------------------------------------------
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    auto_dir = _auto_memory_dir(args.auto_dir)
+    if auto_dir is None:
+        print("[platxa-memory] no auto-memory dir to export", file=sys.stderr)
+        return 2
+
+    dest = Path(args.output).expanduser().resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(dest, "w:gz") as tf:
+            tf.add(auto_dir, arcname=auto_dir.name)
+    except (OSError, tarfile.TarError) as exc:
+        print(f"[platxa-memory] export failed: {exc}", file=sys.stderr)
+        return 1
+    size = dest.stat().st_size
+    print(f"exported {auto_dir} → {dest} ({size} bytes)")
+    return 0
+
+
+# --- subcommand: import -----------------------------------------------------
+
+
+def _validate_tar_member(member: tarfile.TarInfo) -> str | None:
+    """Return an error reason if the member is unsafe, else None.
+
+    Defends against three escape techniques:
+    - ``name`` with absolute path or ``..`` traversal → escapes extract root
+    - symlink / hardlink whose ``linkname`` points outside the archive → a
+      later read or extract dereferences it
+    - device / fifo / character-special members → not a supported payload
+      for memory archives, so reject rather than extract
+    """
+    name = member.name
+    if name.startswith("/") or ".." in Path(name).parts:
+        return f"unsafe member path: {name}"
+    if member.issym() or member.islnk():
+        link = member.linkname or ""
+        if not link or link.startswith("/") or ".." in Path(link).parts:
+            return f"unsafe link target: {name} -> {link}"
+    if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+        return f"refusing non-regular member type: {name}"
+    return None
+
+
+def _import_archive(src: Path, target_dir: Path, force: bool) -> int:
+    if not src.is_file():
+        print(f"[platxa-memory] archive not found: {src}", file=sys.stderr)
+        return 2
+    if target_dir.exists() and not force:
+        print(
+            f"[platxa-memory] target exists: {target_dir} (use --force)",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Validate BEFORE touching the target so a bad archive never destroys
+    # a good memory dir. Also extract to a sibling staging path and swap
+    # atomically so a mid-extract failure leaves the original intact.
+    try:
+        with tarfile.open(src, "r:gz") as tf:
+            members = tf.getmembers()
+            for member in members:
+                reason = _validate_tar_member(member)
+                if reason is not None:
+                    print(f"[platxa-memory] {reason}", file=sys.stderr)
+                    return 1
+
+            staging = target_dir.parent / f".{target_dir.name}.incoming"
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True, exist_ok=True)
+            tf.extractall(staging)
+    except (OSError, tarfile.TarError) as exc:
+        print(f"[platxa-memory] import failed: {exc}", file=sys.stderr)
+        # Best-effort cleanup of staging; do not touch target_dir.
+        try:
+            if "staging" in locals() and staging.exists():
+                shutil.rmtree(staging)
+        except OSError:
+            pass
+        return 1
+
+    # The archive's top-level entry (export writes arcname=auto_dir.name) lives
+    # inside `staging`. Prefer a single-directory payload; otherwise treat the
+    # staging dir itself as the new memory dir.
+    try:
+        entries = [p for p in staging.iterdir()]
+    except OSError as exc:
+        print(f"[platxa-memory] import failed post-extract: {exc}", file=sys.stderr)
+        shutil.rmtree(staging, ignore_errors=True)
+        return 1
+
+    if len(entries) == 1 and entries[0].is_dir():
+        new_root = entries[0]
+    else:
+        new_root = staging
+
+    # Swap: rename target_dir → backup, rename new_root → target_dir, drop backup.
+    backup = None
+    try:
+        if target_dir.exists():
+            backup = target_dir.parent / f".{target_dir.name}.backup"
+            if backup.exists():
+                shutil.rmtree(backup)
+            os.replace(target_dir, backup)
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(new_root, target_dir)
+    except OSError as exc:
+        # Restore the backup if the swap failed partway through.
+        if backup is not None and backup.exists() and not target_dir.exists():
+            try:
+                os.replace(backup, target_dir)
+            except OSError:
+                pass
+        print(f"[platxa-memory] import swap failed: {exc}", file=sys.stderr)
+        shutil.rmtree(staging, ignore_errors=True)
+        return 1
+
+    shutil.rmtree(staging, ignore_errors=True)
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+    print(f"imported {src} → {target_dir}")
+    return 0
+
+
+def _resolve_import_target(auto_dir_arg: str | None) -> Path | None:
+    """Resolve the import target.
+
+    An explicit --auto-dir is honoured even when the path doesn't yet exist
+    (we will create it during extract); otherwise we fall back to the
+    most-recent-mtime auto-memory detection, which DOES require an existing
+    directory. Returns None when neither source yields a target.
+    """
+    if auto_dir_arg:
+        return Path(auto_dir_arg).expanduser().resolve()
+    env = os.environ.get("PLATXA_MEMORY_AUTO_DIR", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return _auto_memory_dir(None)
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    target = _resolve_import_target(args.auto_dir)
+    if target is None:
+        print(
+            "[platxa-memory] no auto-memory dir detected; pass --auto-dir <path>",
+            file=sys.stderr,
+        )
+        return 2
+    src = Path(args.archive).expanduser().resolve()
+    return _import_archive(src, target, args.force)
+
+
+# --- subcommand: prune ------------------------------------------------------
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    project = _project_dir(args.project)
+    marker_dir = project / ".claude"
+    if not marker_dir.is_dir():
+        print("[platxa-memory] no .claude dir; nothing to prune")
+        return 0
+
+    threshold = time.time() - (args.days * 86400)
+    removed: list[str] = []
+    kept = 0
+    try:
+        for path in marker_dir.glob(f"{MARKER_PREFIX}*"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < threshold:
+                if not args.dry_run:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        continue
+                removed.append(path.name)
+            else:
+                kept += 1
+    except OSError as exc:
+        print(f"[platxa-memory] prune failed: {exc}", file=sys.stderr)
+        return 1
+
+    prefix = "would remove" if args.dry_run else "removed"
+    for name in removed:
+        print(f"{prefix}: {name}")
+    print(f"summary: {prefix} {len(removed)}, kept {kept} (threshold={args.days}d)")
+    return 0
+
+
+# --- subcommand: restore ----------------------------------------------------
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    target = _resolve_import_target(args.auto_dir)
+    if target is None:
+        print(
+            "[platxa-memory] no auto-memory dir detected; pass --auto-dir <path>",
+            file=sys.stderr,
+        )
+        return 2
+    src = Path(args.archive).expanduser().resolve()
+    return _import_archive(src, target, force=True)
+
+
+# --- subcommand: migrate ----------------------------------------------------
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    project = _project_dir(args.project)
+    report = {
+        "project": str(project),
+        "current_format_version": "1.0",
+        "target_format_version": "1.0",
+        "migrations_applied": [],
+        "status": "up-to-date",
+        "note": "No memory-format migrations are defined yet; this subcommand "
+        "is a stable entrypoint for future schema changes.",
+    }
+    if args.format == "json":
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"status:  {report['status']}")
+        print(f"format:  {report['current_format_version']}")
+        print(f"note:    {report['note']}")
+    return 0
+
+
+# --- argparse wiring --------------------------------------------------------
+
+
+def _add_project_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--project",
+        default=None,
+        help="Project directory (default: $CLAUDE_PROJECT_DIR or cwd)",
+    )
+
+
+def _add_auto_dir_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--auto-dir",
+        default=None,
+        help="Explicit auto-memory directory "
+        "(default: $PLATXA_MEMORY_AUTO_DIR or most-recent under ~/.claude/projects/)",
+    )
+
+
+def _add_format_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format (default: text)",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="platxa-memory",
+        description=(
+            "Non-interactive CLI for the platxa-memory Claude Code plugin. "
+            "Inspect, search, and maintain the memory store without going "
+            "through a slash-command."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
+
+    # detect-stack
+    p = sub.add_parser(
+        "detect-stack",
+        help="Print the detected project stack (python / typescript / ... / generic)",
+        description=(
+            "Scan the project for stack-marker files and print the stack name. "
+            "Mirrors the detection used by the SessionStart hook."
+        ),
+    )
+    _add_project_arg(p)
+    _add_format_arg(p)
+    p.set_defaults(func=cmd_detect_stack)
+
+    # health
+    p = sub.add_parser(
+        "health",
+        help="Report memory store health (auto-memory dir, counts, status)",
+        description=(
+            "Inspect the auto-memory directory and print a summary: project "
+            "path, memory dir path, MEMORY.md presence, topic-file count, "
+            "and Stop-hook marker count. Exit 0 when healthy, 1 otherwise."
+        ),
+    )
+    _add_project_arg(p)
+    _add_auto_dir_arg(p)
+    _add_format_arg(p)
+    p.set_defaults(func=cmd_health)
+
+    # search
+    p = sub.add_parser(
+        "search",
+        help="Full-text search memory files (ripgrep-backed, stdlib fallback)",
+        description=(
+            "Case-insensitive regex search across the project .claude/ tree "
+            "and the auto-memory directory. Prefers ripgrep when available; "
+            "falls back to a stdlib walker."
+        ),
+    )
+    p.add_argument("pattern", help="Search pattern (regex)")
+    p.add_argument(
+        "--scope",
+        choices=("project", "user", "all"),
+        default="all",
+        help="Search scope (default: all)",
+    )
+    p.add_argument("--limit", type=int, default=50, help="Max hits (default: 50)")
+    _add_project_arg(p)
+    _add_auto_dir_arg(p)
+    _add_format_arg(p)
+    p.set_defaults(func=cmd_search)
+
+    # export
+    p = sub.add_parser(
+        "export",
+        help="Archive the auto-memory directory to a tar.gz",
+        description=(
+            "Create a gzip-compressed tarball of the auto-memory directory. "
+            "Useful for backing up before a prune, or for migrating between "
+            "machines."
+        ),
+    )
+    p.add_argument("output", help="Path to write the tar.gz archive")
+    _add_auto_dir_arg(p)
+    p.set_defaults(func=cmd_export)
+
+    # import
+    p = sub.add_parser(
+        "import",
+        help="Restore auto-memory from a tar.gz archive",
+        description=(
+            "Extract a tar.gz created by `platxa-memory export` into the "
+            "auto-memory directory. Refuses to overwrite an existing "
+            "directory unless --force is given."
+        ),
+    )
+    p.add_argument("archive", help="Path to the tar.gz archive")
+    p.add_argument("--force", action="store_true", help="Overwrite existing memory dir")
+    _add_auto_dir_arg(p)
+    p.set_defaults(func=cmd_import)
+
+    # prune
+    p = sub.add_parser(
+        "prune",
+        help="Remove stale per-session Stop-hook markers",
+        description=(
+            "Delete `.memory-synthesized-<sid>` marker files older than the "
+            "given threshold. Markers are written by the Stop hook and the "
+            "PreToolUse guard to prevent duplicate synthesis; they accumulate "
+            "one per session and can safely be pruned after N days."
+        ),
+    )
+    p.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_PRUNE_DAYS,
+        help=f"Age threshold in days (default: {DEFAULT_PRUNE_DAYS})",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Report without deleting")
+    _add_project_arg(p)
+    p.set_defaults(func=cmd_prune)
+
+    # restore
+    p = sub.add_parser(
+        "restore",
+        help="Restore auto-memory from archive (import with --force)",
+        description=(
+            "Overwrite the auto-memory directory with the contents of a "
+            "tar.gz archive. Equivalent to `import --force` with clearer "
+            "semantics for disaster recovery."
+        ),
+    )
+    p.add_argument("archive", help="Path to the tar.gz archive")
+    _add_auto_dir_arg(p)
+    p.set_defaults(func=cmd_restore)
+
+    # migrate
+    p = sub.add_parser(
+        "migrate",
+        help="Apply memory-format migrations (currently no-op)",
+        description=(
+            "Stable entrypoint for future memory-format migrations. Runs any "
+            "registered migrations in order and reports the result. No "
+            "migrations are defined today — this subcommand exits 0 with an "
+            "up-to-date status."
+        ),
+    )
+    _add_project_arg(p)
+    _add_format_arg(p)
+    p.set_defaults(func=cmd_migrate)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except KeyboardInterrupt:
+        print("[platxa-memory] interrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"[platxa-memory] {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
