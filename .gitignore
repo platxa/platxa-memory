@@ -76,6 +76,9 @@ Thumbs.db
 !.claude/output-styles/
 !.claude/init.sh
 !.claude/CHANGELOG.md
+# Stack-profile templates ship .claude/rules/ bundles that must be committed.
+!templates/**/.claude/
+!templates/**/.claude/**
 CLAUDE.local.md
 
 # Build artifacts
@@ -87,4 +90,3 @@ CLAUDE.local.md
 CLAUDE.md
 checkpoints/
 mao_state.db
-.claude/
