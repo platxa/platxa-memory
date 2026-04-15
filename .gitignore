@@ -88,5 +88,7 @@ CLAUDE.local.md
 
 # Local-only
 CLAUDE.md
+# But the shipped CLAUDE.md skeleton template must be committed.
+!templates/CLAUDE.md
 checkpoints/
 mao_state.db
