@@ -76,7 +76,7 @@ jobs:
           from pathlib import Path
 
           m = json.load(open(".claude-plugin/plugin.json"))
-          prefix = "${CLAUDE_PLUGIN_ROOT}/"
+          marker = "${CLAUDE_PLUGIN_ROOT}/"
           errors = []
           for event, groups in m.get("hooks", {}).items():
               for group in groups:
@@ -86,10 +86,14 @@ jobs:
                           errors.append(f"{event}: forbidden hook type {t!r}")
                           continue
                       cmd = handler.get("command", "")
-                      if not cmd.startswith(prefix):
-                          errors.append(f"{event}: command must start with {prefix}")
+                      # Commands may be bare `${CLAUDE_PLUGIN_ROOT}/...` or
+                      # prefixed by `env KEY=VAL ...` to thread user-config
+                      # values (feature #4). Accept either shape.
+                      idx = cmd.find(marker)
+                      if idx < 0:
+                          errors.append(f"{event}: command missing {marker}")
                           continue
-                      rel = cmd[len(prefix):]
+                      rel = cmd[idx + len(marker):].split()[0]
                       if not Path(rel).is_file():
                           errors.append(f"{event}: command points at missing file {rel}")
           if errors:

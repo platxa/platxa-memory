@@ -15,6 +15,28 @@
     "compaction",
     "claude-code"
   ],
+  "userConfig": {
+    "observation_capture": {
+      "type": "boolean",
+      "description": "Capture tool-use observations for the instincts layer. When disabled, no per-tool invocation records are written. Default off so installing the plugin is invisible until the user opts in.",
+      "default": false
+    },
+    "memory_token_budget": {
+      "type": "integer",
+      "description": "Context-token budget the SessionStart and PostCompact hooks may spend injecting memory + rules. Clamped by the hooks between 500 and 200 000 regardless of the value set here.",
+      "default": 25000,
+      "minimum": 500,
+      "maximum": 200000
+    },
+    "telemetry_endpoint": {
+      "type": "string",
+      "description": "Optional HTTPS endpoint that opt-in usage telemetry will POST to. Leave unset to disable telemetry entirely. No PII or session content is ever transmitted.",
+      "format": "uri",
+      "sensitive": false,
+      "optional": true,
+      "default": ""
+    }
+  },
   "hooks": {
     "SessionStart": [
       {
@@ -22,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session_start_hook.py"
+            "command": "env PLATXA_MEMORY_TOKEN_BUDGET=\"${user_config.memory_token_budget}\" PLATXA_MEMORY_OBSERVATION_CAPTURE=\"${user_config.observation_capture}\" PLATXA_MEMORY_TELEMETRY_ENDPOINT=\"${user_config.telemetry_endpoint}\" ${CLAUDE_PLUGIN_ROOT}/hooks/session_start_hook.py"
           }
         ]
       }
@@ -42,7 +64,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/post_compact_hook.py"
+            "command": "env PLATXA_MEMORY_TOKEN_BUDGET=\"${user_config.memory_token_budget}\" ${CLAUDE_PLUGIN_ROOT}/hooks/post_compact_hook.py"
           }
         ]
       }

@@ -83,6 +83,22 @@ def test_all_shipped_hooks_are_wired() -> None:
     assert not missing, f"plugin.json missing hook events: {missing}"
 
 
+def _script_path_from_command(command: str) -> str:
+    """Extract the `${CLAUDE_PLUGIN_ROOT}/<relative>` target out of a command.
+
+    Commands may be bare (``${CLAUDE_PLUGIN_ROOT}/hooks/foo.py``) or may be
+    prefixed by an ``env KEY=VAL ...`` block used to thread user-config
+    values into the hook's environment (feature #4). Parse either shape.
+    """
+    marker = "${CLAUDE_PLUGIN_ROOT}/"
+    idx = command.find(marker)
+    if idx < 0:
+        raise AssertionError(f"command does not reference CLAUDE_PLUGIN_ROOT: {command!r}")
+    tail = command[idx + len(marker) :]
+    # The script path is the first whitespace-delimited token after the marker.
+    return tail.split()[0]
+
+
 def test_every_referenced_hook_command_points_at_a_real_file() -> None:
     """No dangling references — every command must resolve under hooks/."""
     hooks = _load_manifest().get("hooks", {})
@@ -97,10 +113,7 @@ def test_every_referenced_hook_command_points_at_a_real_file() -> None:
                     f"(CLAUDE.md hard constraint)"
                 )
                 command = handler.get("command", "")
-                assert command.startswith("${CLAUDE_PLUGIN_ROOT}/"), (
-                    f"{event_name}: command must start with ${{CLAUDE_PLUGIN_ROOT}}"
-                )
-                relative = command.removeprefix("${CLAUDE_PLUGIN_ROOT}/")
+                relative = _script_path_from_command(command)
                 target = REPO / relative
                 assert target.is_file(), f"{event_name}: command references missing file {target}"
 
@@ -112,7 +125,7 @@ def test_hook_commands_match_expected_files() -> None:
         for group in hooks.get(event, []):
             for handler in group.get("hooks", []):
                 cmd = handler.get("command", "")
-                commands.append(cmd.removeprefix("${CLAUDE_PLUGIN_ROOT}/"))
+                commands.append(_script_path_from_command(cmd))
         assert expected_path in commands, f"{event} must invoke {expected_path}, got {commands}"
 
 
@@ -178,3 +191,139 @@ def test_marketplace_entry_homepage_matches_manifest() -> None:
 
 def test_marketplace_entry_description_non_empty() -> None:
     assert _load_entry()["description"].strip()
+
+
+# --- userConfig schema (feature #4) ---------------------------------------
+
+
+def test_user_config_declares_required_fields() -> None:
+    user_config = _load_manifest().get("userConfig", {})
+    # Three fields per the feature spec: observation_capture (bool),
+    # memory_token_budget (int, default 25 000), telemetry_endpoint
+    # (optional URL, sensitive: false).
+    assert set(user_config.keys()) >= {
+        "observation_capture",
+        "memory_token_budget",
+        "telemetry_endpoint",
+    }, f"userConfig missing required fields: {list(user_config.keys())}"
+
+
+def test_user_config_observation_capture_is_boolean() -> None:
+    field = _load_manifest()["userConfig"]["observation_capture"]
+    assert field["type"] == "boolean"
+    assert field.get("default") is False, (
+        "observation_capture must default off so installing the plugin is "
+        "invisible until the user opts in"
+    )
+
+
+def test_user_config_memory_token_budget_is_int_with_safe_defaults() -> None:
+    field = _load_manifest()["userConfig"]["memory_token_budget"]
+    assert field["type"] == "integer"
+    assert field["default"] == 25000, "default must match the hook's documented default budget"
+    # The hooks clamp regardless, but the declared bounds should match.
+    assert field.get("minimum") == 500
+    assert field.get("maximum") == 200000
+
+
+def test_user_config_telemetry_endpoint_is_optional_url() -> None:
+    field = _load_manifest()["userConfig"]["telemetry_endpoint"]
+    assert field["type"] == "string"
+    assert field.get("format") == "uri"
+    # Per spec: optional, non-sensitive (the endpoint URL itself is not
+    # a secret — what you send to it is, but the plugin doesn't send
+    # anything until opted in).
+    assert field.get("optional") is True
+    assert field.get("sensitive") is False
+
+
+def test_hooks_thread_memory_token_budget_from_user_config() -> None:
+    """The two budget-aware hooks must receive ``user_config.memory_token_budget``
+    as ``PLATXA_MEMORY_TOKEN_BUDGET`` via the ``env KEY=VAL`` command prefix.
+    """
+    hooks = _load_manifest()["hooks"]
+    for event in ("SessionStart", "PostCompact"):
+        commands = [h["command"] for group in hooks.get(event, []) for h in group.get("hooks", [])]
+        assert commands, f"{event} has no hook commands"
+        assert any(
+            'PLATXA_MEMORY_TOKEN_BUDGET="${user_config.memory_token_budget}"' in cmd
+            for cmd in commands
+        ), (
+            f"{event} must thread user_config.memory_token_budget into "
+            f"PLATXA_MEMORY_TOKEN_BUDGET via the env prefix; got {commands}"
+        )
+
+
+def test_session_start_threads_all_opt_in_user_config() -> None:
+    """SessionStart is the entry point that needs every opt-in flag visible,
+    so all three userConfig fields must be threaded into its env.
+    """
+    hooks = _load_manifest()["hooks"]
+    commands = [
+        h["command"] for group in hooks.get("SessionStart", []) for h in group.get("hooks", [])
+    ]
+    joined = "\n".join(commands)
+    for mapping in (
+        'PLATXA_MEMORY_TOKEN_BUDGET="${user_config.memory_token_budget}"',
+        'PLATXA_MEMORY_OBSERVATION_CAPTURE="${user_config.observation_capture}"',
+        'PLATXA_MEMORY_TELEMETRY_ENDPOINT="${user_config.telemetry_endpoint}"',
+    ):
+        assert mapping in joined, f"SessionStart command missing user-config threading: {mapping!r}"
+
+
+def test_user_config_substitutions_are_shell_quoted() -> None:
+    """Every ``${user_config.X}`` substitution inside a hook command must sit
+    inside double quotes. User-configured values include a URL
+    (``telemetry_endpoint``) that may legitimately contain ``&``, ``;``, or
+    whitespace — characters the shell would otherwise interpret. Unquoted
+    substitution is a command-injection vector once the user opts in, so
+    pin the quoting on the JSON-decoded command string (the actual shell
+    command Claude Code will execute), not on the escaped JSON source.
+    """
+    import re
+
+    manifest = _load_manifest()
+    offenders: list[str] = []
+    for event, groups in manifest.get("hooks", {}).items():
+        for group in groups:
+            for handler in group.get("hooks", []):
+                cmd = handler.get("command", "")
+                for match in re.finditer(r"(.?)\$\{user_config\.[A-Za-z0-9_]+\}(.?)", cmd):
+                    before, after = match.group(1), match.group(2)
+                    if before == '"' and after == '"':
+                        continue
+                    offenders.append(f"{event}: {match.group(0)!r}")
+    assert not offenders, (
+        'user_config substitutions must be shell-quoted ("${user_config.X}") '
+        "to avoid injection via URLs containing & ; or whitespace; "
+        f"unquoted: {offenders}"
+    )
+
+
+def test_every_declared_user_config_field_is_threaded_somewhere() -> None:
+    """Reverse drift guard: every declared userConfig field must be referenced
+    at least once inside a hook command, so a declaration without a consumer
+    fails CI rather than quietly going dead.
+    """
+    import re
+
+    manifest = _load_manifest()
+    declared = set(manifest.get("userConfig", {}).keys())
+    manifest_text = MANIFEST.read_text(encoding="utf-8")
+    referenced = set(re.findall(r"\$\{user_config\.([A-Za-z0-9_]+)\}", manifest_text))
+    unused = declared - referenced
+    assert not unused, f"userConfig fields declared but never referenced in a hook: {unused}"
+
+
+def test_every_user_config_reference_names_a_declared_field() -> None:
+    """Guard against typos: ``${user_config.foo}`` must refer to a field
+    that actually exists in the userConfig declaration.
+    """
+    import re
+
+    manifest = _load_manifest()
+    declared = set(manifest.get("userConfig", {}).keys())
+    manifest_text = MANIFEST.read_text(encoding="utf-8")
+    referenced = set(re.findall(r"\$\{user_config\.([A-Za-z0-9_]+)\}", manifest_text))
+    unknown = referenced - declared
+    assert not unknown, f"plugin.json references undeclared userConfig fields: {unknown}"

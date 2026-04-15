@@ -81,15 +81,18 @@ def test_plugin_manifest_is_installable(repo_root: Path) -> None:
     manifest = repo_root / ".claude-plugin" / "plugin.json"
     data = json.loads(manifest.read_text())
     assert data["name"] == "platxa-memory"
-    # Every hook command must resolve relative to CLAUDE_PLUGIN_ROOT — the
-    # envelope Claude Code hands to `/plugin install`.
-    prefix = "${CLAUDE_PLUGIN_ROOT}/"
+    # Every hook command must reference a real script under CLAUDE_PLUGIN_ROOT.
+    # Commands may be bare or prefixed by `env KEY=VAL ...` to thread
+    # user-config values (feature #4) — parse whichever shape shipped.
+    marker = "${CLAUDE_PLUGIN_ROOT}/"
     for event, groups in data.get("hooks", {}).items():
         for group in groups:
             for handler in group.get("hooks", []):
                 cmd = handler["command"]
-                assert cmd.startswith(prefix), f"{event}: {cmd!r}"
-                target = repo_root / cmd[len(prefix) :]
+                idx = cmd.find(marker)
+                assert idx >= 0, f"{event}: command missing {marker}: {cmd!r}"
+                relative = cmd[idx + len(marker) :].split()[0]
+                target = repo_root / relative
                 assert target.is_file(), f"{event}: {target} missing"
 
 
