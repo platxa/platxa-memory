@@ -8,6 +8,13 @@ share detection logic without duplicating constants.
 Hard constraint (see CLAUDE.md): stdlib only — no SDK, no API, no LLM.
 """
 
+from .atomic import atomic_write, atomic_write_bytes, atomic_write_text
 from .stack import StackInfo, detect_stack
 
-__all__ = ("StackInfo", "detect_stack")
+__all__ = (
+    "StackInfo",
+    "atomic_write",
+    "atomic_write_bytes",
+    "atomic_write_text",
+    "detect_stack",
+)
